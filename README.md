@@ -27,6 +27,9 @@ the related source code, and the model checkpoint locations:
 - `source/sam3-server/sam3/checkpoints/`
 - `source/z-image-server/Z-Image/ckpts/`
 
+These directories are kept in Git with `.gitkeep` files. The actual model
+weights are not included in this repository.
+
 The upstream projects are:
 
 - [SAM3](https://github.com/facebookresearch/sam3)
