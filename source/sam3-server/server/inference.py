@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import threading
 from typing import Any, Callable
 
@@ -17,6 +18,13 @@ from flask import Flask, jsonify, request
 from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import BadRequest, HTTPException, RequestEntityTooLarge
 from werkzeug.utils import secure_filename
+
+# Repository entry points share source/common; deployed containers receive the
+# helper beside flask_api.py and use the normal script-directory import path.
+_COMMON_DIR = Path(__file__).resolve().parents[2] / "common"
+if _COMMON_DIR.is_dir():
+    sys.path.insert(0, str(_COMMON_DIR))
+from gpu_memory import IdleCudaReclaimer
 
 __all__ = ["Sam3ServerConfig", "create_app", "main"]
 
@@ -91,8 +99,12 @@ class _State:
             confidence_threshold=cfg.confidence_threshold,
         )
         self._lock = threading.Lock()
+        self._memory = IdleCudaReclaimer(torch, "sam3", cfg.device)
 
     def segment(self, image: Image.Image, prompt: str) -> list[dict[str, Any]]:
+        return self._memory.run(lambda: self._segment_cpu(image, prompt))
+
+    def _segment_cpu(self, image: Image.Image, prompt: str) -> list[dict[str, Any]]:
 
         # Sam3Processor stores its threshold and find-stage tensors, so treat it
         # as a single-owner GPU object even though each request gets fresh state.
@@ -144,9 +156,7 @@ def _encode_uncompressed_rles(masks: Any) -> list[dict[str, Any]]:
         ]
         if bool(flat[0].item()):
             counts.insert(0, 0)
-        encoded.append(
-            {"size": [height, width], "counts": counts, "starts_with": 0}
-        )
+        encoded.append({"size": [height, width], "counts": counts, "starts_with": 0})
     return encoded
 
 
@@ -266,4 +276,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
