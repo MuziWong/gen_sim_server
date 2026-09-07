@@ -44,6 +44,13 @@ os.environ["CUDA_VISIBLE_DEVICES"] = str(_SERVICE_SETTINGS["gpu"])
 from flask import Flask, jsonify, request, send_file
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
+# Repository entry points share source/common; deployed containers receive the
+# helper beside flask_api.py and use the normal script-directory import path.
+_COMMON_DIR = Path(__file__).resolve().parents[2] / "common"
+if _COMMON_DIR.is_dir():
+    sys.path.insert(0, str(_COMMON_DIR))
+from gpu_memory import IdleCudaReclaimer
+
 __all__ = ["ZImageServerConfig", "create_app", "main"]
 
 
@@ -110,8 +117,12 @@ class _State:
             compile=cfg.compile_model,
         )
         set_attention_backend(cfg.attention_backend)
+        self._memory = IdleCudaReclaimer(torch, "z-image", cfg.device)
 
     def generate_png(self, prompt: str) -> bytes:
+        return self._memory.run(lambda: self._generate_png_cpu(prompt))
+
+    def _generate_png_cpu(self, prompt: str) -> bytes:
         with self._lock, self._inference_context():
             generator = self._torch.Generator(self._cfg.device).manual_seed(
                 self._cfg.seed
@@ -241,4 +252,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

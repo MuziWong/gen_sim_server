@@ -25,10 +25,18 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import threading
 from typing import Any
 import uuid
+
+# Repository entry points share source/common; deployed containers receive the
+# helper beside flask_api.py and use the normal script-directory import path.
+_COMMON_DIR = Path(__file__).resolve().parents[2] / "common"
+if _COMMON_DIR.is_dir():
+    sys.path.insert(0, str(_COMMON_DIR))
+from gpu_memory import IdleCudaReclaimer
 
 
 def _load_service_settings(service_name: str) -> dict[str, Any]:
@@ -109,6 +117,7 @@ class _State:
         self.inference_lock = threading.RLock()
 
         self._load_model()
+        self._memory = IdleCudaReclaimer(torch, "sam3d")
 
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker.start()
@@ -123,6 +132,7 @@ class _State:
     ) -> tuple[_Job, int]:
         job = _Job(job_id=uuid.uuid4().hex, image_bytes=image_bytes, masks=masks)
         with self.lock:
+            self._memory.begin()
             self.jobs[job.job_id] = job
             self.queue.append(job.job_id)
             waiting = len(self.queue) - 1 + (1 if self.current_job_id else 0)
@@ -140,6 +150,7 @@ class _State:
                     job.cancelled = True
                     job.error = "reset"
                     job.done.set()
+                    self._memory.end()
 
             current_id = self.current_job_id
             if current_id is not None:
@@ -220,95 +231,95 @@ class _State:
                     self.cancel_current = False
                     job.done.set()
                     self.cv.notify_all()
+                self._memory.end()
 
     def _run_job(self, job: _Job) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
         if self.inference_module is None or self.inference is None:
             raise RuntimeError(self.init_error or "SAM3D model is not initialized.")
 
-        module = self.inference_module
-        inference = self.inference
-
-        image = _decode_image(module, job.image_bytes)
-        shared_pointmap = _compute_shared_pointmap(module, inference, image)
-        outputs: list[Any] = []
-
-        for _, mask_bytes in job.masks:
+        image = _decode_image(self.inference_module, job.image_bytes)
+        shared_pointmap = _compute_shared_pointmap(
+            self.inference_module, self.inference, image
+        )
+        assets: dict[str, bytes] = {}
+        objects: list[dict[str, Any]] = []
+        for object_id, mask_bytes in job.masks:
             with self.lock:
                 if self.cancel_current:
                     job.cancelled = True
                     job.error = "cancelled by reset"
                     return [], {}
-            mask = _decode_mask(module, mask_bytes)
             with self.inference_lock:
-                outputs.append(
-                    inference(
-                        image,
-                        mask,
-                        seed=42,
-                        pointmap=shared_pointmap,
-                    )
+                obj, object_assets = self._run_object_cpu(
+                    job.job_id, object_id, image, mask_bytes, shared_pointmap
                 )
+            objects.append(obj)
+            assets.update(object_assets)
+        return objects, assets
 
+    def _run_object_cpu(
+        self, job_id: str, object_id: str, image: Any, mask_bytes: bytes, pointmap: Any
+    ) -> tuple[dict[str, Any], dict[str, bytes]]:
+        """Export one object to CPU-only results before the next inference."""
+        mask = _decode_mask(self.inference_module, mask_bytes)
+        output = self.inference(image, mask, seed=42, pointmap=pointmap)
         assets: dict[str, bytes] = {}
         objects: list[dict[str, Any]] = []
-
-        for (object_id, _), output in zip(job.masks, outputs):
-            filename = f"{object_id}.glb"
-            glb_bytes = _export_output_as_glb_bytes(output)
-            assets[filename] = glb_bytes
-            sam3d_rotation = _extract_vector(
-                output,
-                # SAM3D uses "rotation" internally. The public API below
-                # serializes a converted quaternion with an explicit wxyz name.
-                key="rotation",
-                expected_len=4,
-                default=[1.0, 0.0, 0.0, 0.0],
-            )
-            sam3d_translation = _extract_vector(
-                output,
-                key="translation",
-                expected_len=3,
-                default=[0.0, 0.0, 0.0],
-            )
-            sam3d_scale = _extract_vector(
-                output,
-                key="scale",
-                expected_len=3,
-                default=[1.0, 1.0, 1.0],
-            )
-            rotation, translation, scale = _sam3d_pose_to_glb_y_up(
-                rotation_quaternion_wxyz=sam3d_rotation,
-                translation=sam3d_translation,
-                scale=sam3d_scale,
-            )
-            transform_filename = f"{object_id}.json"
-            assets[transform_filename] = (
-                json.dumps(
-                    {
-                        "name": object_id,
-                        "pose_coordinate_system": "glb_y_up",
-                        "rotation_quaternion_wxyz": rotation,
-                        "translation": translation,
-                        "scale": scale,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n"
-            ).encode("utf-8")
-            objects.append(
+        filename = f"{object_id}.glb"
+        glb_bytes = _export_output_as_glb_bytes(output)
+        assets[filename] = glb_bytes
+        sam3d_rotation = _extract_vector(
+            output,
+            # SAM3D uses "rotation" internally. The public API below
+            # serializes a converted quaternion with an explicit wxyz name.
+            key="rotation",
+            expected_len=4,
+            default=[1.0, 0.0, 0.0, 0.0],
+        )
+        sam3d_translation = _extract_vector(
+            output,
+            key="translation",
+            expected_len=3,
+            default=[0.0, 0.0, 0.0],
+        )
+        sam3d_scale = _extract_vector(
+            output,
+            key="scale",
+            expected_len=3,
+            default=[1.0, 1.0, 1.0],
+        )
+        rotation, translation, scale = _sam3d_pose_to_glb_y_up(
+            rotation_quaternion_wxyz=sam3d_rotation,
+            translation=sam3d_translation,
+            scale=sam3d_scale,
+        )
+        transform_filename = f"{object_id}.json"
+        assets[transform_filename] = (
+            json.dumps(
                 {
                     "name": object_id,
-                    "mesh": f"/assets/{job.job_id}/{filename}",
-                    "transform": f"/assets/{job.job_id}/{transform_filename}",
                     "pose_coordinate_system": "glb_y_up",
                     "rotation_quaternion_wxyz": rotation,
                     "translation": translation,
                     "scale": scale,
-                }
+                },
+                ensure_ascii=False,
+                indent=2,
             )
-
-        return objects, assets
+            + "\n"
+        ).encode("utf-8")
+        objects.append(
+            {
+                "name": object_id,
+                "mesh": f"/assets/{job_id}/{filename}",
+                "transform": f"/assets/{job_id}/{transform_filename}",
+                "pose_coordinate_system": "glb_y_up",
+                "rotation_quaternion_wxyz": rotation,
+                "translation": translation,
+                "scale": scale,
+            }
+        )
+        return objects[0], assets
 
     def _load_model(self) -> None:
         try:
@@ -645,4 +656,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
